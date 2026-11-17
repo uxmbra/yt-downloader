@@ -18,7 +18,7 @@ You copy a link and it starts downloading.
 
 ## Install (Windows)
 
-1. Get the code: either `git clone https://github.com/<you>/yt-downloader.git`, or download the ZIP from GitHub and extract it.
+1. Get the code: either `git clone https://github.com/uxmbra/yt-downloader.git`, or download the ZIP from GitHub and extract it.
 2. Double-click **`setup.bat`**.
    It installs anything that's missing (Python, [FFmpeg](https://ffmpeg.org), [Deno](https://deno.com)) using `winget`, installs the Python packages into a private `.venv` folder, and adds a **YT Downloader** shortcut to your Desktop and Start Menu.
 3. After that, launch it from the shortcut, or with `run.bat`.
