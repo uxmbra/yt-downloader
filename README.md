@@ -15,6 +15,7 @@ You copy a link and it starts downloading.
 - **MP3s with tags.** Title, artist and cover art are embedded.
 - **Nice to have:** light and dark themes that follow Windows, a duplicate-link guard, readable error messages, and cleanup of leftover partial files.
 - **Stays working.** YouTube changes often, and yt-dlp (the engine) is updated quietly in the background after you close the app, at most once a day.
+- **Command line too:** `"YT Downloader.exe" <link> [<link> ...]` opens the app with those links already queued.
 
 ## Install (Windows)
 

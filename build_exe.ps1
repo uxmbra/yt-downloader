@@ -30,8 +30,14 @@ foreach ($tool in 'ffmpeg', 'ffprobe', 'deno') {
         }
         Copy-Item $src.FullName $bin -Force
         Write-Host "Bundled $tool"
+        if ($tool -eq 'ffmpeg') {  # FFmpeg is GPL: ship its licence alongside it
+            $lic = Join-Path $src.Directory.Parent.FullName 'LICENSE'
+            if (Test-Path $lic) { Copy-Item $lic (Join-Path $bin 'FFMPEG-LICENSE.txt') -Force }
+            else { Write-Warning 'FFmpeg LICENSE file not found; add it to bin\FFMPEG-LICENSE.txt before sharing.' }
+        }
     } else {
         Write-Warning "$tool not found; the .exe will need it installed separately."
     }
 }
+Copy-Item 'THIRD-PARTY-NOTICES.txt', 'README.md' 'dist\YT Downloader' -Force
 Write-Host "`nDone: dist\YT Downloader\YT Downloader.exe" -ForegroundColor Green

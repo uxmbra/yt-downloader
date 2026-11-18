@@ -1,0 +1,14 @@
+YT Downloader bundles or uses the following third-party software.
+
+yt-dlp              Unlicense (public domain)       https://github.com/yt-dlp/yt-dlp
+yt-dlp-ejs          Unlicense                       https://github.com/yt-dlp/ejs
+CustomTkinter       MIT License                     https://github.com/TomSchimansky/CustomTkinter
+Python              PSF License                     https://www.python.org/
+Deno                MIT License                     https://github.com/denoland/deno
+FFmpeg / ffprobe    GNU GPL v3 (full build by Gyan Doshi)
+                    Builds: https://www.gyan.dev/ffmpeg/builds/
+                    Source: https://ffmpeg.org/download.html  (and https://github.com/FFmpeg/FFmpeg)
+                    The full licence text is in bin\FFMPEG-LICENSE.txt in the release package.
+
+FFmpeg and Deno are shipped unmodified as separate programs in the bin folder; YT Downloader runs them as
+external processes.

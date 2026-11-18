@@ -787,6 +787,9 @@ def main() -> None:
             pass
     ctk.set_appearance_mode("system")
     app = App()
+    # Links passed on the command line ("YT Downloader.exe <url> ...") are queued at startup.
+    if links := " ".join(sys.argv[1:]).strip():
+        app.after(300, lambda: app.add_text(links))
     app.mainloop()
 
 
