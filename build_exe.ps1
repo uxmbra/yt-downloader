@@ -39,5 +39,5 @@ foreach ($tool in 'ffmpeg', 'ffprobe', 'deno') {
         Write-Warning "$tool not found; the .exe will need it installed separately."
     }
 }
-Copy-Item 'THIRD-PARTY-NOTICES.txt', 'README.md' 'dist\YT Downloader' -Force
+Copy-Item 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'README.md' 'dist\YT Downloader' -Force
 Write-Host "`nDone: dist\YT Downloader\YT Downloader.exe" -ForegroundColor Green

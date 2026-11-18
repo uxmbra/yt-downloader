@@ -73,6 +73,10 @@ Run from source with: `.venv\Scripts\python -m ytdl_gui`
 - **"FFmpeg/Deno not found" warning:** run `setup.bat` again, or put `ffmpeg.exe`, `ffprobe.exe` and `deno.exe` in a `bin` folder next to `run.pyw`.
 - **Age-restricted or private videos** need a signed-in account and aren't supported.
 
+## License
+
+[MIT](LICENSE) for this project's code. Bundled third-party tools keep their own licences (see [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt); FFmpeg is GPLv3).
+
 ## Legal
 
 For personal use. Only download content you own or have permission to download, and respect YouTube's Terms of Service and copyright law where you live.
