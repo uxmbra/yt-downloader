@@ -11,7 +11,7 @@ import shutil
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -123,7 +123,12 @@ class Job:
     error: str = ""
     filepath: str = ""
     resolution: str = ""
+    thumbnail_url: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.thumbnail_url and (vid := youtube_video_id(self.url)):
+            self.thumbnail_url = f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
 
     @property
     def display_title(self) -> str:
@@ -132,6 +137,22 @@ class Job:
     @property
     def key(self) -> str:
         return dedupe_key(self.url)
+
+    @property
+    def partial_name(self) -> str:
+        """Stable temp-folder name, so a download interrupted by quitting resumes next time."""
+        safe = re.sub(r"[^\w-]", "_", self.key)[-80:]
+        return f"{safe}-{self.opts.mode}-{self.opts.quality}"
+
+    # Saving the queue between app sessions
+    def to_dict(self) -> dict:
+        return {"url": self.url, "title": self.title, "opts": asdict(self.opts)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Job":
+        known = {f.name for f in fields(JobOptions)}
+        opts = JobOptions(**{k: v for k, v in (data.get("opts") or {}).items() if k in known})
+        return cls(url=data["url"], opts=opts, title=data.get("title") or "")
 
 
 class _Logger:
@@ -184,6 +205,23 @@ def clean_error(msg: str) -> str:
     return msg.splitlines()[0][:300] if msg else "Unknown error"
 
 
+_TRANSIENT = re.compile(
+    r"HTTP Error (403|429|5\d\d)|timed? ?out|Connection (reset|aborted|refused)|Remote end closed|"
+    r"IncompleteRead|getaddrinfo|giving up after|Unable to download (webpage|JSON|video data)|"
+    r"did not get any data blocks|challenge",
+    re.I,
+)
+
+
+def is_transient(msg: str) -> bool:
+    """Errors worth one automatic retry (network blips, expired links, rate limits)."""
+    return bool(_TRANSIENT.search(msg or ""))
+
+
+class LiveStreamError(Exception):
+    pass
+
+
 # ------------------------------------------------------------------ manager
 
 class DownloadManager:
@@ -193,11 +231,22 @@ class DownloadManager:
         self._pending: deque[Job] = deque()
         self._running: set[int] = set()
         self._max_parallel = max_parallel
+        self._paused = False
 
     # ---- queue control
     @property
     def max_parallel(self) -> int:
         return self._max_parallel
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def set_paused(self, paused: bool) -> None:
+        """While paused no new downloads start; running ones finish."""
+        with self._lock:
+            self._paused = paused
+            self._pump()
 
     def set_max_parallel(self, n: int) -> None:
         with self._lock:
@@ -232,7 +281,7 @@ class DownloadManager:
             return len(self._running), len(self._pending)
 
     def _pump(self) -> None:  # caller holds the lock
-        while self._pending and len(self._running) < self._max_parallel:
+        while self._pending and not self._paused and len(self._running) < self._max_parallel:
             job = self._pending.popleft()
             self._running.add(job.id)
             job.status = Status.STARTING
@@ -283,16 +332,35 @@ class DownloadManager:
 
     # ---- the download itself
     def _download(self, job: Job) -> None:
-        if job.cancel_event.is_set():
-            job.status = Status.CANCELLED
-            return
+        tmp = Path(job.opts.output_dir) / PARTIAL_DIR / job.partial_name
+        for attempt in range(2):
+            if job.cancel_event.is_set():
+                job.status, job.detail = Status.CANCELLED, ""
+                break
+            transient = self._attempt(job, tmp)
+            if job.status != Status.FAILED or attempt or not transient:
+                break
+            # One automatic retry for network blips / expired links.
+            job.status, job.detail, job.error = Status.STARTING, "Hit a hiccup, retrying…", ""
+            self._notify(job)
+            if job.cancel_event.wait(3):
+                job.status, job.detail = Status.CANCELLED, ""
+                break
+        job.speed = job.eta = None
+        # Finished, failed or cancelled: the partial files are no longer needed. (If the app is
+        # closed mid-download this line never runs, so the download can resume next launch.)
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            tmp.parent.rmdir()  # only succeeds when no other download is using it
+        except OSError:
+            pass
+
+    def _attempt(self, job: Job, tmp: Path) -> bool:
+        """One try. Sets job.status; returns True when a failure looks temporary."""
         o = job.opts
         job.detail = "Fetching video info…"
+        job.progress = 0.0
         self._notify(job)
-
-        out_dir = Path(o.output_dir)
-        partial_root = out_dir / PARTIAL_DIR
-        tmp = partial_root / f"job{job.id}-{int(time.time() * 1000)}"
         logger = _Logger()
         last_ping = [0.0]
 
@@ -303,7 +371,11 @@ class DownloadManager:
                 self._notify(job)
 
         def on_info(info: dict) -> None:
+            if info.get("is_live"):
+                raise LiveStreamError("This is a live stream. Download it after the stream has ended.")
             job.title = info.get("title") or job.title
+            if not job.thumbnail_url and info.get("thumbnail"):
+                job.thumbnail_url = info["thumbnail"]
             if info.get("height") and o.mode != "mp3":
                 job.resolution = f"{info['height']}p"
                 if info.get("fps") and info["fps"] > 30:
@@ -362,6 +434,7 @@ class DownloadManager:
 
         try:
             opts, late_pps = _build_options(o, tmp, logger, on_progress, on_postprocess)
+            partial_root = tmp.parent
             if not partial_root.exists():
                 partial_root.mkdir(parents=True, exist_ok=True)
                 tools.hide_folder(partial_root)
@@ -378,20 +451,28 @@ class DownloadManager:
             job.status, job.progress, job.detail = Status.DONE, 1.0, ""
         except DownloadCancelled:
             job.status, job.detail = Status.CANCELLED, ""
-        except Exception as exc:  # noqa: BLE001 - any failure ends the job
+        except Exception as exc:  # noqa: BLE001 - any failure ends this attempt
             if job.cancel_event.is_set():
                 job.status, job.detail = Status.CANCELLED, ""
-            else:
-                job.status = Status.FAILED
-                job.error = clean_error(logger.last_error or str(exc))
-                job.detail = ""
-        finally:
-            job.speed = job.eta = None
-            shutil.rmtree(tmp, ignore_errors=True)
-            try:
-                partial_root.rmdir()  # only succeeds when no other job is using it
-            except OSError:
-                pass
+                return False
+            live = _find_cause(exc, LiveStreamError)
+            raw = str(live) if live else (logger.last_error or str(exc))
+            job.status, job.detail = Status.FAILED, ""
+            job.error = raw if live else clean_error(raw)
+            return not live and is_transient(raw)
+        return False
+
+
+def _find_cause(exc: BaseException | None, kind: type) -> BaseException | None:
+    """yt-dlp wraps exceptions raised in hooks; dig out the original one."""
+    seen = 0
+    while exc is not None and seen < 10:
+        if isinstance(exc, kind):
+            return exc
+        ei = getattr(exc, "exc_info", None)
+        exc = (ei[1] if isinstance(ei, tuple) and len(ei) > 1 else None) or exc.__cause__ or exc.__context__
+        seen += 1
+    return None
 
 
 def _base_options(logger: _Logger) -> dict:
@@ -406,6 +487,9 @@ def _base_options(logger: _Logger) -> dict:
         "fragment_retries": 10,
         "concurrent_fragment_downloads": 4,
         "socket_timeout": 30,
+        # If the bundled YouTube challenge-solver scripts don't match this yt-dlp version,
+        # let yt-dlp fetch the matching (hash-checked) ones from its official GitHub release.
+        "remote_components": ["ejs:github"],
     }
     if deno := tools.deno_path():
         opts["js_runtimes"] = {"deno": {"path": deno}}
@@ -477,6 +561,15 @@ def _build_options(o: JobOptions, tmp: Path, logger: _Logger, on_progress, on_po
     return opts, late
 
 
-def cleanup_partials(output_dir: str) -> None:
-    """Remove leftovers from downloads interrupted by closing the app."""
-    shutil.rmtree(Path(output_dir) / PARTIAL_DIR, ignore_errors=True)
+def cleanup_partials(output_dir: str, keep: set[str] = frozenset()) -> None:
+    """Delete leftover partial downloads, except those of queue items that will resume."""
+    root = Path(output_dir) / PARTIAL_DIR
+    if not root.is_dir():
+        return
+    for child in root.iterdir():
+        if child.name not in keep:
+            shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
+    try:
+        root.rmdir()
+    except OSError:
+        pass

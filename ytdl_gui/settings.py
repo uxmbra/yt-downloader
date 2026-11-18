@@ -27,8 +27,12 @@ class Settings:
     mp3_quality: str = "320"       # 320 | 256 | 192 | 0 (VBR V0)
     embed_thumbnail: bool = True
     expand_playlists: bool = True
-    auto_update: bool = True
+    auto_update: bool = True       # check for a newer yt-dlp in the background
     last_update_check: float = 0.0
+    notify_when_done: bool = True  # flash the taskbar + chime when the queue finishes
+    show_thumbnails: bool = True
+    window_geometry: str = ""
+    window_zoomed: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -42,8 +46,31 @@ class Settings:
         return s
 
     def save(self) -> None:
-        try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        _write_json(CONFIG_FILE, asdict(self))
+
+
+QUEUE_FILE = CONFIG_DIR / "queue.json"
+
+
+def load_queue() -> list[dict]:
+    """Unfinished downloads saved when the app last closed."""
+    try:
+        data = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+        return [d for d in data if isinstance(d, dict) and d.get("url")]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_queue(items: list[dict]) -> None:
+    _write_json(QUEUE_FILE, items)
+
+
+def _write_json(path: Path, data) -> None:
+    """Write atomically, so a crash mid-write can't leave a corrupt file."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass

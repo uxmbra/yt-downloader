@@ -13,6 +13,7 @@ if (-not (Test-Path $py)) { throw 'Run setup.bat first.' }
     --add-data 'assets;assets' `
     --collect-data customtkinter `
     --collect-all yt_dlp_ejs `
+    --copy-metadata yt-dlp `
     run.pyw
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 

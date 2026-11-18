@@ -8,11 +8,12 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from . import tools
+from . import __version__, thumbs, tools, updater
 from .engine import (
     ACTIVE,
     FINISHED,
@@ -26,7 +27,8 @@ from .engine import (
     is_collection_url,
     is_youtube_url,
 )
-from .settings import APP_NAME, Settings
+from .settings import APP_NAME, Settings, load_queue, save_queue
+from .single_instance import SingleInstance, send_to_running
 
 # ------------------------------------------------------------------ styling
 ACCENT = ("#D62F35", "#E5383B")
@@ -43,6 +45,7 @@ TEXT = ("#16161A", "#EDEDF0")
 MUTED = ("#6B6B75", "#9696A0")
 SUCCESS = ("#1E8E3E", "#43D18A")
 ERROR = ("#C5221F", "#FF6B6B")
+INFO_BG = ("#E8F0FE", "#1E2A3D")
 
 MODE_LABELS = {"MP4": "mp4", "MP3": "mp3", "MP4 + MP3": "both"}
 QUALITY_LABELS = {
@@ -56,6 +59,7 @@ QUALITY_LABELS = {
 }
 MP3_LABELS = {"320 kbps (best)": "320", "256 kbps": "256", "192 kbps": "192", "VBR V0 (smaller files)": "0"}
 PARALLEL_CHOICES = ["1", "2", "3", "4", "5", "6"]
+UPDATE_CHECK_INTERVAL = 6 * 3600
 
 
 def label_for(mapping: dict[str, str], value: str) -> str:
@@ -85,6 +89,15 @@ def truncate(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
 
 
+def bind_tree(widget, sequence: str, handler, skip=()) -> None:
+    """Bind an event on a widget and all its descendants (CTk widgets are made of several)."""
+    if widget in skip:
+        return
+    tk.Misc.bind(widget, sequence, handler, "+")
+    for child in widget.winfo_children():
+        bind_tree(child, sequence, handler, skip)
+
+
 # ------------------------------------------------------------------ queue row
 class JobRow(ctk.CTkFrame):
     def __init__(self, master, job: Job, app: "App") -> None:
@@ -92,31 +105,44 @@ class JobRow(ctk.CTkFrame):
         self.job, self.app = job, app
         self._last_state: tuple | None = None
         self._spinning = False
-        self.grid_columnconfigure(0, weight=1)
+        self._thumb_url = ""
+        self.grid_columnconfigure(1, weight=1)
+
+        # Thumbnail (placeholder until the image arrives)
+        self.thumb = ctk.CTkLabel(
+            self, text="♪" if job.opts.mode == "mp3" else "▶", width=thumbs.THUMB_SIZE[0],
+            height=thumbs.THUMB_SIZE[1], corner_radius=8, fg_color=SUBTLE, text_color=MUTED,
+            font=app.f_section)
+        if app.settings.show_thumbnails:
+            self.thumb.grid(row=0, column=0, rowspan=3, padx=(12, 2), pady=12)
 
         self.title_lbl = ctk.CTkLabel(self, text="", anchor="w", font=app.f_row_title, text_color=TEXT)
-        self.title_lbl.grid(row=0, column=0, sticky="ew", padx=(16, 8), pady=(12, 0))
+        self.title_lbl.grid(row=0, column=1, sticky="ew", padx=(14, 8), pady=(12, 0))
 
         self.badge = ctk.CTkLabel(
             self, text="", font=app.f_badge, fg_color=SUBTLE, corner_radius=6, text_color=MUTED, height=22
         )
-        self.badge.grid(row=0, column=1, padx=4, pady=(12, 0))
+        self.badge.grid(row=0, column=2, padx=4, pady=(12, 0))
 
         self.action_btn = ctk.CTkButton(self, text="", width=86, height=30, corner_radius=8, font=app.f_small_bold)
-        self.action_btn.grid(row=0, column=2, rowspan=3, padx=(10, 4))
+        self.action_btn.grid(row=0, column=3, rowspan=3, padx=(10, 4))
 
         self.remove_btn = ctk.CTkButton(
             self, text="✕", width=30, height=30, corner_radius=8, fg_color="transparent",
             hover_color=SUBTLE_HOVER, text_color=MUTED, font=app.f_small_bold, command=self._remove,
         )
-        self.remove_btn.grid(row=0, column=3, rowspan=3, padx=(0, 12))
+        self.remove_btn.grid(row=0, column=4, rowspan=3, padx=(0, 12))
 
         self.bar = ctk.CTkProgressBar(self, height=6, corner_radius=3, progress_color=ACCENT, fg_color=SUBTLE)
         self.bar.set(0)
-        self.bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=(9, 5))
+        self.bar.grid(row=1, column=1, columnspan=2, sticky="ew", padx=14, pady=(9, 5))
 
         self.status_lbl = ctk.CTkLabel(self, text="", anchor="w", font=app.f_small, text_color=MUTED, justify="left")
-        self.status_lbl.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 11))
+        self.status_lbl.grid(row=2, column=1, columnspan=2, sticky="ew", padx=14, pady=(0, 11))
+
+        buttons = (self.action_btn, self.remove_btn)
+        bind_tree(self, "<Button-3>", self._context_menu)
+        bind_tree(self, "<Double-Button-1>", lambda e: self._open_file(), skip=buttons)
         self.refresh()
 
     # -- actions
@@ -128,11 +154,66 @@ class JobRow(ctk.CTkFrame):
 
     def _retry(self) -> None:
         self.app.manager.retry(self.job)
+        self.app.queue_changed()
 
     def _show(self) -> None:
         tools.open_folder(self.job.opts.output_dir, self.job.filepath or None)
 
+    def _video_path(self) -> str:
+        path = self.job.filepath
+        if self.job.opts.mode == "both" and path:
+            mp4 = os.path.splitext(path)[0] + ".mp4"
+            if os.path.exists(mp4):
+                return mp4
+        return path
+
+    def _open_file(self) -> None:
+        if self.job.status == Status.DONE and not tools.open_file(self._video_path()):
+            self.app.toast("That file has been moved or deleted.", color=ERROR)
+
+    def _copy_link(self) -> None:
+        self.app.clipboard_clear()
+        self.app.clipboard_append(self.job.url)
+        self.app.ignore_clipboard(self.job.url)
+        self.app.toast("Link copied")
+
+    def _context_menu(self, event) -> None:
+        j = self.job
+        menu = tk.Menu(self, tearoff=0)
+        if j.status == Status.DONE:
+            if j.opts.mode == "both":
+                menu.add_command(label="Play video", command=self._open_file)
+                menu.add_command(label="Play MP3", command=lambda: tools.open_file(j.filepath))
+            else:
+                menu.add_command(label="Open", command=self._open_file)
+            menu.add_command(label="Show in folder", command=self._show)
+            menu.add_separator()
+        elif j.status in (Status.FAILED, Status.CANCELLED):
+            menu.add_command(label="Retry", command=self._retry)
+            menu.add_separator()
+        elif j.status not in FINISHED:
+            menu.add_command(label="Cancel", command=self._cancel)
+            menu.add_separator()
+        menu.add_command(label="Copy link", command=self._copy_link)
+        menu.add_command(label="Open in browser", command=lambda: webbrowser.open(j.url))
+        if j.error:
+            menu.add_command(label="Copy error message", command=lambda: (
+                self.app.clipboard_clear(), self.app.clipboard_append(j.error)))
+        menu.add_separator()
+        menu.add_command(label="Remove from list", command=self._remove)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     # -- drawing
+    def set_thumbnail(self, pil_image) -> None:
+        if not self.winfo_exists():
+            return
+        img = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=thumbs.THUMB_SIZE)
+        self.thumb.configure(image=img, text="", fg_color="transparent")
+        self.thumb._thumb_ref = img  # keep a reference
+
     def _spin(self, on: bool) -> None:
         if on and not self._spinning:
             self.bar.configure(mode="indeterminate")
@@ -144,13 +225,17 @@ class JobRow(ctk.CTkFrame):
 
     def refresh(self) -> None:
         j = self.job
+        if j.thumbnail_url != self._thumb_url and self.app.settings.show_thumbnails:
+            self._thumb_url = j.thumbnail_url
+            self.app.thumbs.request(j.thumbnail_url, self.set_thumbnail)
+
         state = (j.status, round(j.progress, 3), j.detail, j.title, j.resolution, j.error,
-                 int((j.speed or 0) / 20000), None if j.eta is None else int(j.eta))
+                 int((j.speed or 0) / 20000), None if j.eta is None else int(j.eta), self.app.manager.paused)
         if state == self._last_state:
             return
         self._last_state = state
 
-        self.title_lbl.configure(text=truncate(j.display_title, 88))
+        self.title_lbl.configure(text=truncate(j.display_title, 80))
         badge = {"mp4": "MP4", "mp3": "MP3", "both": "MP4 + MP3"}[j.opts.mode]
         if j.opts.mode != "mp3":
             badge += " · " + (j.resolution or ("Best" if j.opts.quality == "best" else f"≤{j.opts.quality}p"))
@@ -159,7 +244,7 @@ class JobRow(ctk.CTkFrame):
         s = j.status
         color = MUTED
         if s == Status.QUEUED:
-            text = "Waiting in queue"
+            text = "Paused: press Resume to continue" if self.app.manager.paused else "Waiting in queue"
             self._spin(False)
             self.bar.set(0)
         elif s == Status.STARTING:
@@ -185,7 +270,12 @@ class JobRow(ctk.CTkFrame):
             name = os.path.basename(j.filepath) if j.filepath else ""
             if j.opts.mode == "both" and name:
                 name = os.path.splitext(name)[0] + " (.mp4 + .mp3)"
-            text = "✓  Saved" + (f"  ·  {name}" if name else "")
+            size = ""
+            try:
+                size = fmt_bytes(os.path.getsize(self._video_path()))
+            except OSError:
+                pass
+            text = "✓  Saved" + (f"  ·  {name}" if name else "") + (f"  ·  {size}" if size else "")
             color = SUCCESS
         elif s == Status.FAILED:
             self._spin(False)
@@ -196,7 +286,7 @@ class JobRow(ctk.CTkFrame):
             self._spin(False)
             self.bar.set(0)
             text = "Cancelled"
-        self.status_lbl.configure(text=truncate(text, 140), text_color=color)
+        self.status_lbl.configure(text=truncate(text, 130), text_color=color)
         idle = s in (Status.QUEUED, Status.FAILED, Status.CANCELLED)  # hide the 0% dot
         self.bar.configure(progress_color=SUCCESS if s == Status.DONE else SUBTLE if idle else ACCENT)
 
@@ -218,13 +308,16 @@ class SettingsWindow(ctk.CTkToplevel):
         self.app = app
         s = app.settings
         self.title("Settings")
-        self.geometry("560x700")
-        self.resizable(False, False)
+        self.geometry("580x800")
+        self.minsize(520, 500)
         self.configure(fg_color=BG)
         self.transient(app)
         self.after(250, self._bring_to_front)
 
-        body = ctk.CTkFrame(self, fg_color=CARD, corner_radius=14, border_width=1, border_color=CARD_BORDER)
+        ctk.CTkButton(self, text="Done", height=36, corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      font=app.f_body_bold, command=self.destroy).pack(side="bottom", fill="x", padx=18, pady=(0, 18))
+        body = ctk.CTkScrollableFrame(self, fg_color=CARD, corner_radius=14, border_width=1,
+                                      border_color=CARD_BORDER, scrollbar_button_color=SUBTLE)
         body.pack(fill="both", expand=True, padx=18, pady=18)
         body.grid_columnconfigure(0, weight=1)
         row = 0
@@ -232,64 +325,78 @@ class SettingsWindow(ctk.CTkToplevel):
         def section(text: str) -> None:
             nonlocal row
             ctk.CTkLabel(body, text=text, font=app.f_section, text_color=TEXT, anchor="w").grid(
-                row=row, column=0, columnspan=2, sticky="ew", padx=20, pady=(18 if row else 16, 4))
+                row=row, column=0, columnspan=2, sticky="ew", padx=16, pady=(18 if row else 12, 4))
             row += 1
 
-        def switch(text: str, hint: str, attr: str) -> None:
+        def switch(text: str, hint: str, attr: str, on_change=None) -> None:
             nonlocal row
             var = tk.BooleanVar(value=getattr(s, attr))
+
+            def changed() -> None:
+                self._set(attr, var.get())
+                if on_change:
+                    on_change()
+
             sw = ctk.CTkSwitch(body, text=text, variable=var, font=app.f_body, text_color=TEXT,
-                               progress_color=ACCENT, command=lambda: self._set(attr, var.get()))
-            sw.grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=(6, 0))
+                               progress_color=ACCENT, command=changed)
+            sw.grid(row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
             row += 1
             if hint:
-                ctk.CTkLabel(body, text=hint, font=app.f_small, text_color=MUTED, anchor="w", justify="left").grid(
-                    row=row, column=0, columnspan=2, sticky="w", padx=(66, 20))
+                ctk.CTkLabel(body, text=hint, font=app.f_small, text_color=MUTED, anchor="w", justify="left",
+                             wraplength=430).grid(row=row, column=0, columnspan=2, sticky="w", padx=(62, 16))
                 row += 1
+
+        # Engine first: it's what keeps downloads working.
+        section("Download engine (yt-dlp)")
+        eng = ctk.CTkFrame(body, fg_color=SUBTLE, corner_radius=10)
+        eng.grid(row=row, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 4))
+        eng.grid_columnconfigure(0, weight=1)
+        row += 1
+        self.engine_version = ctk.CTkLabel(eng, text="", font=app.f_body_bold, text_color=TEXT, anchor="w")
+        self.engine_version.grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
+        self.engine_status = ctk.CTkLabel(eng, text="", font=app.f_small, text_color=MUTED, anchor="w",
+                                          justify="left", wraplength=300)
+        self.engine_status.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
+        self.engine_btn = ctk.CTkButton(eng, text="", width=150, height=32, corner_radius=8,
+                                        font=app.f_small_bold, command=self._engine_action)
+        self.engine_btn.grid(row=0, column=1, rowspan=2, padx=12)
+        switch("Check for engine updates automatically",
+               "YouTube changes things often; a current yt-dlp keeps downloads working and at full quality.",
+               "auto_update")
+        ff = "found" if tools.ffmpeg_path() else "MISSING"
+        dn = "found" if tools.deno_path() else "MISSING"
+        ctk.CTkLabel(body, text=f"FFmpeg {ff}   ·   Deno {dn}", font=app.f_small, text_color=MUTED,
+                     anchor="w").grid(row=row, column=0, sticky="w", padx=16, pady=(8, 0))
+        row += 1
 
         section("Video")
         switch("Max compatibility mode", "H.264 + AAC so it plays on anything (TVs, old phones). Caps at ~1080p.",
                "compat_mode")
-        switch("Allow HDR video", "Off: picks the SDR version at the same resolution (HDR looks washed out\n"
-               "on most screens).", "allow_hdr")
+        switch("Allow HDR video", "Off: picks the SDR version at the same resolution (HDR looks washed out on "
+               "most screens).", "allow_hdr")
 
         section("Audio")
         ctk.CTkLabel(body, text="MP3 quality", font=app.f_body, text_color=TEXT, anchor="w").grid(
-            row=row, column=0, sticky="w", padx=20, pady=6)
-        mp3 = ctk.CTkOptionMenu(body, values=list(MP3_LABELS), width=190, fg_color=SUBTLE, button_color=SUBTLE,
+            row=row, column=0, sticky="w", padx=16, pady=6)
+        mp3 = ctk.CTkOptionMenu(body, values=list(MP3_LABELS), width=200, fg_color=SUBTLE, button_color=SUBTLE,
                                 button_hover_color=SUBTLE_HOVER, text_color=TEXT, font=app.f_body,
                                 command=lambda v: self._set("mp3_quality", MP3_LABELS[v]))
         mp3.set(label_for(MP3_LABELS, s.mp3_quality))
-        mp3.grid(row=row, column=1, sticky="e", padx=20, pady=6)
+        mp3.grid(row=row, column=1, sticky="e", padx=16, pady=6)
         row += 1
         switch("Embed cover art and tags", "", "embed_thumbnail")
 
         section("Queue")
         switch("Split playlists and channels", "A playlist link adds every video as its own item.",
                "expand_playlists")
+        switch("Notify when downloads finish", "Flashes the taskbar button and plays a chime if the window "
+               "isn't in front.", "notify_when_done")
+        switch("Show thumbnails", "Applies to newly added items.", "show_thumbnails")
 
-        section("Engine")
-        switch("Keep yt-dlp updated automatically", "Updates quietly after you close the app (at most once a day).",
-               "auto_update")
-        eng = ctk.CTkFrame(body, fg_color="transparent")
-        eng.grid(row=row, column=0, columnspan=2, sticky="ew", padx=20, pady=(10, 0))
-        eng.grid_columnconfigure(0, weight=1)
-        row += 1
-        ff = "found" if tools.ffmpeg_path() else "MISSING"
-        dn = "found" if tools.deno_path() else "MISSING"
-        self.engine_lbl = ctk.CTkLabel(
-            eng, text=f"yt-dlp {tools.ytdlp_version()}   ·   FFmpeg {ff}   ·   Deno {dn}",
-            font=app.f_small, text_color=MUTED, anchor="w")
-        self.engine_lbl.grid(row=0, column=0, sticky="w")
-        self.update_btn = ctk.CTkButton(eng, text="Update now", width=110, height=30, corner_radius=8,
-                                        fg_color=SUBTLE, hover_color=SUBTLE_HOVER, text_color=TEXT,
-                                        font=app.f_small_bold, command=self._update_now)
-        self.update_btn.grid(row=0, column=1, sticky="e")
-        if not tools.can_self_update():
-            self.update_btn.configure(state="disabled")
-
-        ctk.CTkButton(self, text="Done", height=36, corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      font=app.f_body_bold, command=self.destroy).pack(fill="x", padx=18, pady=(0, 18))
+        ctk.CTkLabel(body, text=f"{APP_NAME} {__version__}   ·   github.com/uxmbra/yt-downloader",
+                     font=app.f_small, text_color=MUTED, anchor="w").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(22, 12))
+        self.refresh_engine()
 
     def _bring_to_front(self) -> None:
         self.app.apply_icon(self)
@@ -300,35 +407,50 @@ class SettingsWindow(ctk.CTkToplevel):
         setattr(self.app.settings, attr, value)
         self.app.settings.save()
 
-    def _update_now(self) -> None:
-        self.update_btn.configure(state="disabled", text="Updating…")
+    def _engine_action(self) -> None:
+        if self.app.update_state == "ready":
+            self.app.restart_for_update()
+        else:
+            self.app.check_for_updates(manual=True)
 
-        def work() -> None:
-            ok, msg = tools.update_ytdlp()
-            self.app.post(lambda: self._update_done(ok, msg))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _update_done(self, ok: bool, msg: str) -> None:
+    def refresh_engine(self) -> None:
         if not self.winfo_exists():
             return
-        self.update_btn.configure(state="normal", text="Update now")
-        if ok:
-            self.app.settings.last_update_check = time.time()
-            self.app.settings.save()
-            self.engine_lbl.configure(text=f"yt-dlp {msg} installed. Restart the app to use it.", text_color=SUCCESS)
+        a = self.app
+        st = a.update_state
+        self.engine_version.configure(text=f"yt-dlp {updater.active_version()}")
+        busy = st in ("checking", "downloading")
+        msg = {
+            "idle": "Click to check for a newer version.",
+            "checking": "Checking for updates…",
+            "downloading": f"Downloading update… {a.update_progress * 100:.0f}%",
+            "up_to_date": "You're on the latest version.",
+            "ready": f"Version {a.update_version} is ready. Restart to start using it "
+                     "(unfinished downloads pick up where they left off).",
+            "error": a.update_message or "Couldn't check for updates.",
+        }[st]
+        color = SUCCESS if st in ("up_to_date", "ready") else ERROR if st == "error" else MUTED
+        self.engine_status.configure(text=msg, text_color=color)
+        if st == "ready":
+            self.engine_btn.configure(text="Restart now", state="normal", fg_color=ACCENT,
+                                      hover_color=ACCENT_HOVER, text_color="white")
         else:
-            self.engine_lbl.configure(text=f"Update failed: {truncate(msg, 60)}", text_color=ERROR)
+            self.engine_btn.configure(text="Checking…" if busy else "Check for updates",
+                                      state="disabled" if busy else "normal", fg_color=CARD,
+                                      hover_color=SUBTLE_HOVER, text_color=TEXT)
 
 
 # ------------------------------------------------------------------ main window
 class App(ctk.CTk):
-    def __init__(self) -> None:
+    def __init__(self, instance: SingleInstance | None = None) -> None:
         super().__init__()
         self.settings = Settings.load()
+        self.instance = instance
         self.title(APP_NAME)
-        self.geometry("1000x740")
-        self.minsize(780, 560)
+        self.geometry(self.settings.window_geometry or "1000x760")
+        self.minsize(800, 580)
+        if self.settings.window_zoomed:
+            self.after(10, lambda: self.state("zoomed"))
         self.configure(fg_color=BG)
         self.apply_icon(self)
 
@@ -345,23 +467,32 @@ class App(ctk.CTk):
 
         self._events: queue.SimpleQueue = queue.SimpleQueue()
         self.manager = DownloadManager(self._events.put, self.settings.max_parallel)
+        self.thumbs = thumbs.ThumbnailLoader(self.post)
         self.jobs: list[Job] = []
         self.rows: dict[int, JobRow] = {}
         self._clip_seen: set[str] = set()
         self._last_clip = self._read_clipboard()  # ignore whatever was copied before launch
         self._toast_after: str | None = None
+        self._save_after: str | None = None
         self._expanding = 0
         self._settings_win: SettingsWindow | None = None
+        self._batch: set[int] = set()        # jobs in the current "session" of downloads
+        self._was_busy = False
+        self.update_state, self.update_version, self.update_message = "idle", "", ""
+        self.update_progress = 0.0
 
         self._build()
-        cleanup_partials(self.settings.output_dir)
+        self._restore_queue()
 
         self.bind("<Control-v>", self._on_ctrl_v)
         self.bind("<Control-V>", self._on_ctrl_v)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.instance:
+            self.instance.serve(lambda text: self.post(lambda: self._on_second_launch(text)))
         self.after(100, self._drain_events)
         self.after(700, self._poll_clipboard)
         self.after(50, self.entry.focus_set)
+        self.after(3000, self._auto_update_check)
 
     # ---------------------------------------------------------------- layout
     def _build(self) -> None:
@@ -459,11 +590,13 @@ class App(ctk.CTk):
         ctk.CTkLabel(qhead, text="Queue", font=self.f_section, text_color=TEXT).grid(row=0, column=0, padx=(2, 10))
         self.counts_lbl = ctk.CTkLabel(qhead, text="", font=self.f_small, text_color=MUTED, anchor="w")
         self.counts_lbl.grid(row=0, column=1, sticky="w")
+        btn_style = dict(height=30, corner_radius=8, fg_color="transparent", border_width=1,
+                         border_color=CARD_BORDER, hover_color=SUBTLE_HOVER, text_color=TEXT, font=self.f_small_bold)
+        self.pause_btn = ctk.CTkButton(qhead, text="Pause", width=96, command=self.toggle_pause, **btn_style)
+        self.pause_btn.grid(row=0, column=2, padx=(8, 0))
         for col, (txt, cmd) in enumerate((("Retry failed", self.retry_failed), ("Clear finished", self.clear_finished),
-                                          ("Cancel all", self.cancel_all)), start=2):
-            ctk.CTkButton(qhead, text=txt, width=104, height=30, corner_radius=8, fg_color="transparent",
-                          border_width=1, border_color=CARD_BORDER, hover_color=SUBTLE_HOVER, text_color=TEXT,
-                          font=self.f_small_bold, command=cmd).grid(row=0, column=col, padx=(8, 0))
+                                          ("Cancel all", self.cancel_all)), start=3):
+            ctk.CTkButton(qhead, text=txt, width=104, command=cmd, **btn_style).grid(row=0, column=col, padx=(8, 0))
 
         # Queue list
         self.list = ctk.CTkScrollableFrame(root, fg_color="transparent", corner_radius=0,
@@ -472,13 +605,26 @@ class App(ctk.CTk):
         self.list.grid_columnconfigure(0, weight=1)
         self.empty_lbl = ctk.CTkLabel(
             self.list, text="Nothing here yet.\n\nCopy a YouTube link in your browser and it shows up here,\n"
-                            "or paste one above (Ctrl+V works anywhere in this window).",
+                            "or paste one above (Ctrl+V works anywhere in this window).\n\n"
+                            "Tip: right-click a download for more options.",
             font=self.f_body, text_color=MUTED, justify="center")
         self.empty_lbl.pack(pady=70)
 
+        # Update banner (hidden until an engine update is ready)
+        self.banner = ctk.CTkFrame(root, fg_color=INFO_BG, corner_radius=10)
+        self.banner.grid_columnconfigure(0, weight=1)
+        self.banner_lbl = ctk.CTkLabel(self.banner, text="", font=self.f_small_bold, text_color=TEXT, anchor="w")
+        self.banner_lbl.grid(row=0, column=0, sticky="ew", padx=14, pady=8)
+        ctk.CTkButton(self.banner, text="Later", width=70, height=28, corner_radius=8, fg_color="transparent",
+                      hover_color=SUBTLE_HOVER, text_color=TEXT, font=self.f_small_bold,
+                      command=lambda: self.banner.grid_remove()).grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(self.banner, text="Restart now", width=110, height=28, corner_radius=8, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, font=self.f_small_bold,
+                      command=self.restart_for_update).grid(row=0, column=2, padx=(0, 10))
+
         # Footer
         foot = ctk.CTkFrame(root, fg_color="transparent")
-        foot.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        foot.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         foot.grid_columnconfigure(0, weight=1)
         self.toast_lbl = ctk.CTkLabel(foot, text="", font=self.f_small, text_color=MUTED, anchor="w")
         self.toast_lbl.grid(row=0, column=0, sticky="ew")
@@ -525,6 +671,14 @@ class App(ctk.CTk):
         s = self.settings
         return JobOptions(mode=s.mode, quality=s.quality, output_dir=s.output_dir, compat=s.compat_mode,
                           allow_hdr=s.allow_hdr, mp3_quality=s.mp3_quality, embed_thumbnail=s.embed_thumbnail)
+
+    def bring_to_front(self) -> None:
+        if self.state() == "iconic":
+            self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(150, lambda: self.attributes("-topmost", False))
+        self.focus_force()
 
     # ---------------------------------------------------------------- option callbacks
     def _on_mode(self, label: str, save: bool = True) -> None:
@@ -576,6 +730,11 @@ class App(ctk.CTk):
             return  # normal paste into a text box (the entry adds on <<Paste>>)
         self._add_from_clipboard()
 
+    def _on_second_launch(self, text: str) -> None:
+        self.bring_to_front()
+        if text.strip():
+            self.add_text(text)
+
     def add_text(self, text: str, from_clipboard: bool = False, empty_msg: str | None = None) -> bool:
         urls = extract_urls(text)
         if from_clipboard:
@@ -603,14 +762,17 @@ class App(ctk.CTk):
             self.toast("Already in the queue")
         return True
 
-    def add_url(self, url: str, title: str = "") -> bool:
-        opts = self._current_options()
+    def add_url(self, url: str, title: str = "", opts: JobOptions | None = None) -> bool:
+        opts = opts or self._current_options()
         job = Job(url=url, opts=opts, title=title)
         outputs = {"mp4": {"mp4"}, "mp3": {"mp3"}, "both": {"mp4", "mp3"}}
         for other in self.jobs:
             if (other.key == job.key and other.status not in FINISHED
                     and outputs[other.opts.mode] & outputs[opts.mode]):
                 return False  # would write the same file as a download that's already queued
+        if not any(j.status not in FINISHED for j in self.jobs):
+            self._batch = set()  # queue was idle: start counting a new batch
+        self._batch.add(job.id)
         self.jobs.append(job)
         if self.empty_lbl.winfo_ismapped():
             self.empty_lbl.pack_forget()
@@ -619,6 +781,7 @@ class App(ctk.CTk):
         self.rows[job.id] = row
         self.manager.submit(job)
         self._update_counts()
+        self.queue_changed()
         return True
 
     def _expand_async(self, url: str) -> None:
@@ -667,6 +830,11 @@ class App(ctk.CTk):
         except tk.TclError:
             return None
 
+    def ignore_clipboard(self, text: str) -> None:
+        """Don't auto-add something the app itself just copied."""
+        self._last_clip = text
+        self._clip_seen.update(extract_urls(text))
+
     def _poll_clipboard(self) -> None:
         try:
             if self.clip_var.get():
@@ -691,9 +859,11 @@ class App(ctk.CTk):
             row.destroy()
         if job in self.jobs:
             self.jobs.remove(job)
+        self._batch.discard(job.id)
         if not self.jobs:
             self.empty_lbl.pack(pady=70)
         self._update_counts()
+        self.queue_changed()
 
     def clear_finished(self) -> None:
         for job in [j for j in self.jobs if j.status in (Status.DONE, Status.CANCELLED)]:
@@ -702,10 +872,22 @@ class App(ctk.CTk):
     def retry_failed(self) -> None:
         for job in [j for j in self.jobs if j.status == Status.FAILED]:
             self.manager.retry(job)
+        self.queue_changed()
 
     def cancel_all(self) -> None:
         for job in [j for j in self.jobs if j.status not in FINISHED]:
             self.manager.cancel(job)
+
+    def toggle_pause(self) -> None:
+        paused = not self.manager.paused
+        self.manager.set_paused(paused)
+        self.pause_btn.configure(text="Resume" if paused else "Pause",
+                                 fg_color=SEG_SELECTED if paused else "transparent")
+        for row in self.rows.values():
+            if row.job.status == Status.QUEUED:
+                row.refresh()
+        self._update_counts()
+        self.toast("Queue paused: downloads already running will finish." if paused else "Queue resumed")
 
     def _update_counts(self) -> None:
         by = {s: 0 for s in Status}
@@ -716,7 +898,7 @@ class App(ctk.CTk):
         if active:
             parts.append(f"{active} downloading")
         if by[Status.QUEUED]:
-            parts.append(f"{by[Status.QUEUED]} waiting")
+            parts.append(f"{by[Status.QUEUED]} {'paused' if self.manager.paused else 'waiting'}")
         if self._expanding:
             parts.append("reading playlist…")
         if by[Status.DONE]:
@@ -724,10 +906,30 @@ class App(ctk.CTk):
         if by[Status.FAILED]:
             parts.append(f"{by[Status.FAILED]} failed")
         self.counts_lbl.configure(text="  ·  ".join(parts))
+
+        busy = bool(active or by[Status.QUEUED])
         title = APP_NAME
-        if active or by[Status.QUEUED]:
-            title = f"({active + by[Status.QUEUED]}) {APP_NAME}"
+        if busy:
+            batch = [j for j in self.jobs if j.id in self._batch]
+            if batch:
+                done = sum(1.0 if j.status in FINISHED else j.progress for j in batch)
+                title = f"{done / len(batch) * 100:.0f}%  ·  {active + by[Status.QUEUED]} left  ·  {APP_NAME}"
         self.title(title)
+        if self._was_busy and not busy:
+            self._on_queue_finished()
+        self._was_busy = busy
+
+    def _on_queue_finished(self) -> None:
+        batch = [j for j in self.jobs if j.id in self._batch]
+        ok = sum(j.status == Status.DONE for j in batch)
+        failed = sum(j.status == Status.FAILED for j in batch)
+        if not ok and not failed:
+            return
+        msg = f"All done: {ok} downloaded" + (f", {failed} failed" if failed else "")
+        self.toast(msg, color=SUCCESS if not failed else ERROR, seconds=10)
+        if self.settings.notify_when_done and not tools.is_foreground(self):
+            tools.flash_taskbar(self)
+            tools.chime()
 
     def _drain_events(self) -> None:
         dirty: set[int] = set()
@@ -740,44 +942,131 @@ class App(ctk.CTk):
                     item()
         except queue.Empty:
             pass
+        finished = False
         for job_id in dirty:
             row = self.rows.get(job_id)
             if row is not None:
                 row.refresh()
+                finished |= row.job.status in FINISHED
         if dirty:
             self._update_counts()
+        if finished:
+            self.queue_changed()
         self.after(100, self._drain_events)
 
-    # ---------------------------------------------------------------- closing
-    def _on_close(self) -> None:
-        running = [j for j in self.jobs if j.status not in FINISHED]
-        if running and not messagebox.askyesno(
-            APP_NAME, f"{len(running)} download(s) haven't finished.\nQuit anyway and cancel them?", parent=self
-        ):
-            return
-        for j in running:
-            self.manager.cancel(j)
-        self._maybe_schedule_update()
-        self.settings.save()
-        self.destroy()
+    # ---------------------------------------------------------------- remembering the queue
+    def queue_changed(self) -> None:
+        """Save the unfinished queue soon (debounced), so it survives closing or a crash."""
+        if self._save_after:
+            self.after_cancel(self._save_after)
+        self._save_after = self.after(1500, self._save_queue)
 
-    def _maybe_schedule_update(self) -> None:
-        s = self.settings
-        if not (s.auto_update and tools.can_self_update()) or time.time() - s.last_update_check < 86400:
+    def _save_queue(self) -> None:
+        self._save_after = None
+        save_queue([j.to_dict() for j in self.jobs if j.status not in FINISHED])
+
+    def _restore_queue(self) -> None:
+        saved = []
+        for d in load_queue():
+            try:
+                saved.append(Job.from_dict(d))
+            except (KeyError, TypeError):
+                pass
+        # Delete leftover partial downloads except the ones about to resume.
+        keep = {j.partial_name for j in saved}
+        for folder in {self.settings.output_dir, *(j.opts.output_dir for j in saved)}:
+            cleanup_partials(folder, keep)
+        restored = sum(self.add_url(j.url, j.title, j.opts) for j in saved)
+        if restored:
+            self.toast(f"Picked up {restored} unfinished download{'s' if restored != 1 else ''} from last time")
+
+    # ---------------------------------------------------------------- engine updates
+    def _auto_update_check(self) -> None:
+        if self.settings.auto_update and time.time() - self.settings.last_update_check > UPDATE_CHECK_INTERVAL:
+            self.check_for_updates(manual=False)
+
+    def check_for_updates(self, manual: bool) -> None:
+        if self.update_state in ("checking", "downloading"):
             return
-        s.last_update_check = time.time()
-        flags = (0x00000008 | tools.NO_WINDOW) if tools.IS_WINDOWS else 0  # DETACHED_PROCESS
+        self._set_update_state("checking")
+
+        def progress(frac: float) -> None:
+            self.post(lambda: self._set_update_state("downloading", progress=frac))
+
+        def work() -> None:
+            result = updater.check_and_download(progress)
+            self.post(lambda: self._update_done(result, manual))
+
+        threading.Thread(target=work, name="engine-update", daemon=True).start()
+
+    def _update_done(self, result: updater.UpdateResult, manual: bool) -> None:
+        if result.status != "error":
+            self.settings.last_update_check = time.time()
+            self.settings.save()
+        self.update_version = result.version
+        self._set_update_state(result.status, message=result.message)
+        if result.status == "ready":
+            self.banner_lbl.configure(
+                text=f"⬆  A newer download engine (yt-dlp {result.version}) is ready. "
+                     "Restart to use it; unfinished downloads resume automatically.")
+            self.banner.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        elif manual and result.status == "up_to_date":
+            self.toast(f"yt-dlp {result.version} is the latest version", color=SUCCESS)
+
+    def _set_update_state(self, state: str, message: str = "", progress: float | None = None) -> None:
+        self.update_state = state
+        if message:
+            self.update_message = message
+        if progress is not None:
+            self.update_progress = progress
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.refresh_engine()
+
+    def restart_for_update(self) -> None:
+        running = sum(j.status in ACTIVE for j in self.jobs)
+        if running and not messagebox.askyesno(
+            APP_NAME, f"{running} download(s) are running. They'll continue from where they are after the "
+                      "restart.\n\nRestart now?", parent=self):
+            return
+        self._shutdown()
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
         try:
-            subprocess.Popen(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "--disable-pip-version-check",
-                 "yt-dlp[default]"],
-                creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
-            )
-        except OSError:
-            pass
+            subprocess.Popen(updater.restart_command(), env=env, close_fds=True)
+        finally:
+            self.destroy()
+
+    # ---------------------------------------------------------------- closing
+    def _shutdown(self) -> None:
+        """Save everything. Unfinished downloads are resumed next time the app opens."""
+        if self._save_after:
+            self.after_cancel(self._save_after)
+        self._save_queue()
+        zoomed = self.state() == "zoomed"
+        self.settings.window_zoomed = zoomed
+        if not zoomed and self.state() == "normal":
+            self.settings.window_geometry = self.geometry()
+        self.settings.save()
+        self.thumbs.shutdown()
+        if self.instance:
+            self.instance.release()
+
+    def _on_close(self) -> None:
+        self._shutdown()
+        self.destroy()
 
 
 def main() -> None:
+    args = [a for a in sys.argv[1:] if a != "--restarted"]
+    restarted = len(args) != len(sys.argv) - 1
+    links = " ".join(args).strip()
+
+    # One window at a time: a second launch hands its links to the running one.
+    instance = SingleInstance()
+    if not instance.acquire(wait=10 if restarted else 0):
+        if send_to_running(links):
+            return
+        instance = None  # couldn't reach it either; run without the single-instance guard
+
     if tools.IS_WINDOWS:
         try:
             import ctypes
@@ -786,9 +1075,8 @@ def main() -> None:
         except Exception:
             pass
     ctk.set_appearance_mode("system")
-    app = App()
-    # Links passed on the command line ("YT Downloader.exe <url> ...") are queued at startup.
-    if links := " ".join(sys.argv[1:]).strip():
+    app = App(instance)
+    if links:  # "YT Downloader.exe <url> ..." queues those links
         app.after(300, lambda: app.add_text(links))
     app.mainloop()
 

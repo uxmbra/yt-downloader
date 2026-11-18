@@ -85,26 +85,59 @@ def ytdlp_version() -> str:
         return "?"
 
 
-def can_self_update() -> bool:
-    return not is_frozen()
-
-
-def update_ytdlp() -> tuple[bool, str]:
-    """Upgrade yt-dlp with pip. Takes effect the next time the app starts."""
-    if not can_self_update():
-        return False, "Updating isn't available in the .exe build. Download a newer release instead."
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "--disable-pip-version-check", "yt-dlp[default]"]
+def flash_taskbar(window) -> None:
+    """Flash the taskbar button until the window is focused (Windows)."""
+    if not IS_WINDOWS:
+        return
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, creationflags=NO_WINDOW)
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout or "pip failed").strip().splitlines()[-1]
-    out = subprocess.run(
-        [sys.executable, "-c", "from yt_dlp.version import __version__ as v; print(v)"],
-        capture_output=True, text=True, creationflags=NO_WINDOW,
-    ).stdout.strip()
-    return True, out or "updated"
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND), ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT), ("dwTimeout", wintypes.DWORD)]
+
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        # FLASHW_TRAY | FLASHW_TIMERNOFG: flash until the window comes to the foreground
+        info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x02 | 0x0C, 0, 0)
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        pass
+
+
+def is_foreground(window) -> bool:
+    """Is this window the one the user is currently using?"""
+    if not IS_WINDOWS:
+        return window.focus_displayof() is not None
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        return ctypes.windll.user32.GetForegroundWindow() == hwnd
+    except Exception:
+        return True
+
+
+def chime() -> None:
+    if IS_WINDOWS:
+        try:
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+
+
+def open_file(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    if IS_WINDOWS:
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+    return True
 
 
 def open_folder(path: str | Path, select_file: str | None = None) -> None:

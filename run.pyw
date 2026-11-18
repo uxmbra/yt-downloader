@@ -29,6 +29,9 @@ def _crash(exc: BaseException) -> None:
 
 if __name__ == "__main__":
     try:
+        from ytdl_gui import updater
+
+        updater.activate()  # use a newer downloaded yt-dlp, if there is one (before yt_dlp is imported)
         from ytdl_gui.gui import main
 
         main()
